@@ -3,20 +3,20 @@ import subprocess
 import tempfile
 import os
 import logging
+import re
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+def sanitize_filename(filename):
+    """Remove special characters that break FFmpeg"""
+    # Keep only alphanumeric, dots, dashes, underscores
+    return re.sub(r'[^\w\-.]', '_', filename)
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({
-        'status': 'online',
-        'service': 'ffmpeg-subtitle-burner',
-        'endpoints': {
-            'burn-subtitles': 'POST /burn-subtitles (multipart/video, multipart/srt)',
-            'health': 'GET /health'
-        }
-    })
+    return jsonify({'status': 'online', 'service': 'ffmpeg-subtitle-burner'})
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -24,60 +24,128 @@ def health():
 
 @app.route('/burn-subtitles', methods=['POST'])
 def burn_subtitles():
+    video_path = None
+    srt_path = None
+    output_path = None
+    
     try:
-        if 'video' not in request.files or 'srt' not in request.files:
-            return jsonify({'error': 'Need video and srt files'}), 400
+        logger.info("=== Received burn-subtitles request ===")
+        
+        if 'video' not in request.files:
+            return jsonify({'error': 'Missing video file'}), 400
+        
+        if 'srt' not in request.files:
+            return jsonify({'error': 'Missing srt file'}), 400
         
         video_file = request.files['video']
         srt_file = request.files['srt']
         
-        # Create temp files
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as video_temp:
-            video_file.save(video_temp.name)
-            video_path = video_temp.name
+        logger.info(f"Original video name: {video_file.filename}")
+        logger.info(f"Original SRT name: {srt_file.filename}")
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.srt', encoding='utf-8') as srt_temp:
-            srt_temp.write(srt_file.read())
-            srt_temp.flush()
-            srt_path = srt_temp.name
+        # Create temp files with SAFE names
+        video_fd, video_path = tempfile.mkstemp(suffix='.mp4', prefix='video_')
+        os.close(video_fd)
         
-        output_path = tempfile.mktemp(suffix='.mp4')
+        srt_fd, srt_path = tempfile.mkstemp(suffix='.srt', prefix='subs_')
+        os.close(srt_fd)
         
-        # FFmpeg - SIMPLE & WORKING
+        output_fd, output_path = tempfile.mkstemp(suffix='.mp4', prefix='output_')
+        os.close(output_fd)
+        
+        # Save files
+        video_file.save(video_path)
+        srt_file.save(srt_path)
+        
+        logger.info(f"Saved video to: {video_path}")
+        logger.info(f"Saved SRT to: {srt_path}")
+        logger.info(f"Output will be: {output_path}")
+        
+        # Escape paths for FFmpeg (critical!)
+        video_path_escaped = video_path.replace('\\', '/').replace(':', '\\:')
+        srt_path_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
+        
+        # FFmpeg command
         cmd = [
             'ffmpeg', '-y',
             '-i', video_path,
-            '-vf', f'subtitles={srt_path}:force_style=\'FontSize=24,PrimaryColour=&Hffffff&,OutlineColour=&H000000&,Outline=2\'',
+            '-vf', f'subtitles={srt_path_escaped}',
             '-c:a', 'copy',
             '-c:v', 'libx264',
-            '-preset', 'fast',
+            '-preset', 'ultrafast',
+            '-crf', '23',
             output_path
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        logger.info(f"Running FFmpeg...")
+        logger.debug(f"Command: {' '.join(cmd)}")
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=900  # 15 minutes
+        )
         
         if result.returncode != 0:
-            return jsonify({'error': 'FFmpeg failed', 'stdout': result.stdout, 'stderr': result.stderr}), 500
+            logger.error(f"FFmpeg failed with return code: {result.returncode}")
+            logger.error(f"STDOUT: {result.stdout}")
+            logger.error(f"STDERR: {result.stderr}")
+            return jsonify({
+                'error': 'FFmpeg processing failed',
+                'return_code': result.returncode,
+                'stderr': result.stderr[-1000:]
+            }), 500
+        
+        logger.info("FFmpeg completed successfully!")
+        
+        # Verify output exists
+        if not os.path.exists(output_path):
+            logger.error("Output file was not created!")
+            return jsonify({'error': 'Output file not created'}), 500
+        
+        output_size = os.path.getsize(output_path)
+        logger.info(f"Output file size: {output_size} bytes ({output_size / 1024 / 1024:.2f} MB)")
+        
+        if output_size == 0:
+            logger.error("Output file is empty!")
+            return jsonify({'error': 'Output file is empty'}), 500
+        
+        logger.info("Sending file to client...")
         
         return send_file(
             output_path,
             mimetype='video/mp4',
             as_attachment=True,
-            download_name='video_with_subs.mp4'
+            download_name='video_with_romanian_subs.mp4'
         )
     
     except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Timeout - video too large'}), 408
+        logger.error("FFmpeg processing timeout!")
+        return jsonify({'error': 'Processing timeout - video too large or complex'}), 408
+    
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.exception("Unexpected error occurred:")
+        return jsonify({
+            'error': 'Server error',
+            'details': str(e),
+            'type': type(e).__name__
+        }), 500
+    
     finally:
-        # Cleanup
-        for path in [video_path, srt_path, output_path]:
-            if os.path.exists(path):
+        # Cleanup temp files
+        logger.info("Cleaning up temporary files...")
+        for path in [video_path, srt_path]:
+            if path and os.path.exists(path):
                 try:
                     os.remove(path)
-                except:
-                    pass
+                    logger.debug(f"Removed: {path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove {path}: {e}")
+        
+        # Don't delete output_path yet - send_file needs it
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    port = int(os.environ.get('PORT', 8080))
+    logger.info(f"Starting server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
