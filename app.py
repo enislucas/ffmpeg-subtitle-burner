@@ -72,7 +72,7 @@ def burn_subtitles():
             '-vf', f'subtitles={srt_path_escaped}',
             '-c:a', 'copy',
             '-c:v', 'libx264',
-            '-preset', 'fast',
+            '-preset', 'medium',
             '-crf', '23',
             output_path
         ]
